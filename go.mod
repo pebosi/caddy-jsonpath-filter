@@ -1,4 +1,4 @@
-module jsonfilterpath
+module github.com/pebosi/caddy-jsonpath-filter
 
 go 1.23.6
 

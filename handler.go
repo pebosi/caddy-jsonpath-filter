@@ -4,64 +4,73 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/PaesslerAG/jsonpath"
 	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
 
+// JSONPathFilter implements a reverse_proxy response modifier that applies a JSONPath filter.
+// It reads the JSONPath query from a header on the original request (default "X-JsonPath").
 type JSONPathFilter struct {
-	HeaderName string `json:"header_name"`
+	// HeaderName is the name of the header to look for on the original request.
+	// If not set, it defaults to "X-JsonPath".
+	HeaderName string `json:"header_name,omitempty"`
 }
 
-func (jpf *JSONPathFilter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	capture := newResponseCapture(w)
-	if err := next.ServeHTTP(capture, r); err != nil {
-		return err
+// ModifyResponse implements the reverse_proxy response modifier interface.
+func (jpf *JSONPathFilter) ModifyResponse(res *http.Response) error {
+	// Process only JSON responses.
+	contentType := res.Header.Get("Content-Type")
+	if !strings.Contains(contentType, "application/json") {
+		return nil
 	}
 
-	contentType := capture.Header().Get("Content-Type")
-	if strings.Contains(contentType, "application/json") {
-		var responseBody map[string]interface{}
-		if err := json.Unmarshal(capture.body.Bytes(), &responseBody); err != nil {
-			return fmt.Errorf("failed to unmarshal JSON: %v", err)
-		}
+	// Read and close the existing response body.
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %v", err)
+	}
+	res.Body.Close()
 
-		jsonPathQuery := r.Header.Get(jpf.HeaderName)
-		var output interface{}
-		if jsonPathQuery != "" {
-			var err error
-			output, err = applyJSONPathFilter(responseBody, jsonPathQuery)
-			if err != nil {
-				return err
-			}
-		} else {
-			output = responseBody
-		}
-
-		h := w.Header()
-		for k, v := range capture.Header() {
-			h[k] = v
-		}
-		h.Set("Content-Type", "application/json")
-		h.Del("Content-Length")
-		w.WriteHeader(capture.status)
-
-		return json.NewEncoder(w).Encode(output)
+	// Unmarshal the response JSON.
+	var responseBody map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &responseBody); err != nil {
+		return fmt.Errorf("failed to unmarshal JSON: %v", err)
 	}
 
-	h := w.Header()
-	for k, v := range capture.Header() {
-		h[k] = v
+	// Get the JSONPath query from the original request's header.
+	var jsonPathQuery string
+	if res.Request != nil {
+		jsonPathQuery = res.Request.Header.Get(jpf.HeaderName)
 	}
-	w.WriteHeader(capture.status)
-	_, err := w.Write(capture.body.Bytes())
-	return err
+
+	// If a query is provided, apply it.
+	output := responseBody
+	if jsonPathQuery != "" {
+		output, err = applyJSONPathFilter(responseBody, jsonPathQuery)
+		if err != nil {
+			return fmt.Errorf("JSONPath filter error: %v", err)
+		}
+	}
+
+	// Marshal the (possibly filtered) result back into JSON.
+	newBodyBytes, err := json.Marshal(output)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %v", err)
+	}
+
+	// Update headers and reset the response body.
+	res.Header.Set("Content-Type", "application/json")
+	res.Header.Del("Content-Length")
+	res.Body = io.NopCloser(bytes.NewReader(newBodyBytes))
+	return nil
 }
 
+// applyJSONPathFilter applies the JSONPath query to data.
 func applyJSONPathFilter(data map[string]interface{}, query string) (map[string]interface{}, error) {
 	result, err := jsonpath.Get(query, data)
 	if err != nil {
@@ -74,60 +83,31 @@ func applyJSONPathFilter(data map[string]interface{}, query string) (map[string]
 	return filteredData, nil
 }
 
-type responseCapture struct {
-	rw          http.ResponseWriter
-	header      http.Header
-	status      int
-	body        bytes.Buffer
-	wroteHeader bool
-}
+// UnmarshalCaddyfile configures JSONPathFilter from Caddyfile tokens.
+// It allows an optional argument to override the default header ("X-JsonPath").
+func (jpf *JSONPathFilter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// Set default header name.
+	jpf.HeaderName = "X-JsonPath"
 
-func newResponseCapture(rw http.ResponseWriter) *responseCapture {
-	return &responseCapture{
-		rw:     rw,
-		header: make(http.Header),
-		status: http.StatusOK,
+	// Allow an override: e.g., "jsonpath_filter My-Header" will use "My-Header".
+	for d.Next() {
+		if d.NextArg() {
+			jpf.HeaderName = d.Val()
+		}
 	}
+	return nil
 }
 
-func (rc *responseCapture) Header() http.Header {
-	return rc.header
-}
-
-func (rc *responseCapture) Write(b []byte) (int, error) {
-	if !rc.wroteHeader {
-		rc.WriteHeader(http.StatusOK)
+// CaddyModule returns the Caddy module information.
+// Note the module ID is namespaced under reverse_proxy.response_modifiers,
+// meaning it can only be used within a reverse_proxy block.
+func (JSONPathFilter) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.handlers.reverse_proxy.response_modifiers.jsonpath_filter",
+		New: func() caddy.Module { return new(JSONPathFilter) },
 	}
-	return rc.body.Write(b)
-}
-
-func (rc *responseCapture) WriteHeader(statusCode int) {
-	if rc.wroteHeader {
-		return
-	}
-	rc.status = statusCode
-	rc.wroteHeader = true
 }
 
 func init() {
 	caddy.RegisterModule(JSONPathFilter{})
-	httpcaddyfile.RegisterHandlerDirective("jsonpath_filter", parseJSONPathFilter)
-}
-
-func parseJSONPathFilter(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	args := h.RemainingArgs()
-	headerName := "X-JsonPath"
-	if len(args) > 0 {
-		headerName = args[0]
-	}
-	return &JSONPathFilter{
-		HeaderName: headerName,
-	}, nil
-}
-
-func (JSONPathFilter) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "http.handlers.jsonpath_filter",
-		New: func() caddy.Module { return new(JSONPathFilter) },
-	}
 }

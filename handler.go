@@ -115,9 +115,10 @@ func init() {
 }
 
 func parseJSONPathFilter(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	args := h.RemainingArgs()
 	headerName := "X-JsonPath"
-	if h.NextArg() {
-		headerName = h.Val()
+	if len(args) > 0 {
+		headerName = args[0]
 	}
 	return &JSONPathFilter{
 		HeaderName: headerName,
